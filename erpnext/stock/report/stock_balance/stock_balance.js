@@ -119,6 +119,12 @@ frappe.query_reports["Stock Balance"] = {
 			fieldtype: "Check",
 			default: 0,
 		},
+		{
+			fieldname: "ignore_last_transactions_for_balance",
+			label: __("Ignore Last Transactions for Balance"),
+			fieldtype: "Check",
+			default: 0,
+		},
 	],
 
 	formatter: function (value, row, column, data, default_formatter) {
