@@ -9,7 +9,7 @@ import frappe
 from frappe import _
 from frappe.query_builder import Order
 from frappe.query_builder.functions import Coalesce
-from frappe.utils import add_days, cint, date_diff, flt, getdate
+from frappe.utils import add_days, cint, date_diff, flt, getdate, get_datetime
 from frappe.utils.nestedset import get_descendants_of
 
 import erpnext
@@ -75,6 +75,12 @@ class StockBalanceReport:
 	def prepare_opening_data_from_closing_balance(self) -> None:
 		self.opening_data = frappe._dict({})
 
+		# If ignore_last_transactions_for_balance is checked, use the direct SQL approach
+		if self.filters.get("ignore_last_transactions_for_balance"):
+			self.opening_data = self.get_opening_data_from_last_entry()
+			return
+
+		# Otherwise use the original approach with closing balance
 		closing_balance = self.get_closing_balance()
 		if not closing_balance:
 			return
@@ -88,6 +94,108 @@ class StockBalanceReport:
 			group_by_key = self.get_group_by_key(entry)
 			if group_by_key not in self.opening_data:
 				self.opening_data.setdefault(group_by_key, entry)
+
+	def get_opening_data_from_last_entry(self) -> frappe._dict:
+		"""
+		Get opening balances by finding the latest entry before from_date for each item-warehouse combination.
+		This is used when ignore_last_transactions_for_balance is checked.
+		"""
+		opening_data = frappe._dict({})
+		from_datetime = get_datetime(f"{self.from_date} 00:00:00")
+
+		# Get all relevant item-warehouse combinations
+		filters = {"docstatus": 1}
+		if self.filters.get("company"):
+			filters["company"] = self.filters.get("company")
+		if self.filters.get("warehouse"):
+			filters["warehouse"] = self.filters.get("warehouse")
+		if self.filters.get("item_code"):
+			filters["item_code"] = self.filters.get("item_code")
+
+		# Get all bins that match our filters
+		bin_filters = {}
+		if self.filters.get("warehouse"):
+			bin_filters["warehouse"] = self.filters.get("warehouse")
+		if self.filters.get("item_code"):
+			bin_filters["item_code"] = self.filters.get("item_code")
+
+		bins = frappe.get_all("Bin", filters=bin_filters, fields=["item_code", "warehouse"])
+
+		# For each bin, get the latest SLE before from_date
+		for bin in bins:
+			# Apply additional filters based on item group if specified
+			if self.filters.get("item_group"):
+				item_details = frappe.db.get_value("Item", bin.item_code, ["item_group"], as_dict=True)
+				if not item_details or item_details.item_group != self.filters.get("item_group"):
+					continue
+
+			# Apply warehouse type filter if specified
+			if self.filters.get("warehouse_type"):
+				warehouse_details = frappe.db.get_value("Warehouse", bin.warehouse, ["warehouse_type"], as_dict=True)
+				if not warehouse_details or warehouse_details.warehouse_type != self.filters.get("warehouse_type"):
+					continue
+
+			# Get the latest SLE before from_date
+			sle = frappe.db.sql("""
+				SELECT
+					name, item_code, warehouse, stock_value, valuation_rate,
+					actual_qty, qty_after_transaction, stock_value_difference,
+					posting_date, posting_time, company, voucher_type, voucher_no,
+					batch_no, serial_no, serial_and_batch_bundle, has_serial_no
+				FROM `tabStock Ledger Entry`
+				WHERE item_code = %s AND warehouse = %s
+					AND TIMESTAMP(posting_date, posting_time) < %s
+					AND is_cancelled = 0
+					AND docstatus < 2
+				ORDER BY posting_date DESC, posting_time DESC, creation DESC
+				LIMIT 1
+			""", (bin.item_code, bin.warehouse, from_datetime), as_dict=True)
+
+			if not sle:
+				continue
+
+			# Get item details
+			item_details = frappe.db.get_value("Item",
+				bin.item_code,
+				["item_name", "item_group", "stock_uom"],
+				as_dict=True
+			)
+
+			balance_qty = sle[0].qty_after_transaction
+			balance_value = sle[0].stock_value
+
+			# Create entry with all required fields
+			entry = frappe._dict({
+				"item_code": bin.item_code,
+				"warehouse": bin.warehouse,
+				"posting_date": sle[0].posting_date,
+				"posting_time": sle[0].posting_time,
+				"company": sle[0].company,
+				"voucher_type": sle[0].voucher_type,
+				"voucher_no": sle[0].voucher_no,
+				"qty_after_transaction": sle[0].qty_after_transaction,
+				"valuation_rate": sle[0].valuation_rate,
+				"stock_value": sle[0].stock_value,
+				"batch_no": sle[0].batch_no,
+				"serial_no": sle[0].serial_no,
+				"serial_and_batch_bundle": sle[0].serial_and_batch_bundle,
+				"has_serial_no": sle[0].has_serial_no,
+				"item_group": item_details.item_group,
+				"stock_uom": item_details.stock_uom,
+				"item_name": item_details.item_name,
+				# Set both bal_qty and opening_qty to the calculated balance
+				"bal_qty": balance_qty,
+				"bal_val": balance_value,
+				# Explicitly set opening_qty and opening_val to match the calculated balance
+				"opening_qty": balance_qty,
+				"opening_val": balance_value
+			})
+
+			# Add to opening data
+			group_by_key = self.get_group_by_key(entry)
+			opening_data.setdefault(group_by_key, entry)
+
+		return opening_data
 
 	def prepare_new_data(self):
 		self.item_warehouse_map = self.get_item_warehouse_map()
@@ -205,6 +313,31 @@ class StockBalanceReport:
 
 		value_diff = flt(entry.stock_value_difference)
 
+		# When using ignore_last_transactions_for_balance, opening balances are already set
+		# from the latest entry before from_date, so we only process entries from from_date onwards
+		if self.filters.get("ignore_last_transactions_for_balance"):
+			# Only process entries from from_date onwards
+			if entry.posting_date >= self.from_date and entry.posting_date <= self.to_date:
+				if flt(qty_diff, self.float_precision) >= 0:
+					qty_dict.in_qty += qty_diff
+				else:
+					qty_dict.out_qty += abs(qty_diff)
+
+				if flt(value_diff, self.float_precision) >= 0:
+					qty_dict.in_val += value_diff
+				else:
+					qty_dict.out_val += abs(value_diff)
+
+				qty_dict.val_rate = entry.valuation_rate
+				qty_dict.bal_qty += qty_diff
+				qty_dict.bal_val += value_diff
+
+			# Note: We don't need to update opening_qty and opening_val here
+			# because they're already set correctly in the initialize_data method
+			# from the values calculated in get_opening_data_from_last_entry
+			return
+
+		# Original behavior when not using ignore_last_transactions_for_balance
 		if entry.posting_date < self.from_date or entry.voucher_no in self.opening_vouchers.get(
 			entry.voucher_type, []
 		):
@@ -300,6 +433,8 @@ class StockBalanceReport:
 				sle.item_code,
 				sle.warehouse,
 				sle.posting_date,
+				sle.posting_time,
+				sle.posting_datetime,
 				sle.actual_qty,
 				sle.valuation_rate,
 				sle.company,
@@ -372,8 +507,13 @@ class StockBalanceReport:
 		return query
 
 	def apply_date_filters(self, query, sle) -> str:
-		if not self.filters.ignore_closing_balance and self.start_from:
+		# When using ignore_last_transactions_for_balance, we don't need to filter by start_from
+		# as we're getting opening balances directly from the latest entry before from_date
+		if not self.filters.get("ignore_last_transactions_for_balance") and not self.filters.ignore_closing_balance and self.start_from:
 			query = query.where(sle.posting_date >= self.start_from)
+		elif self.filters.get("ignore_last_transactions_for_balance"):
+			# When using ignore_last_transactions_for_balance, we only need entries from from_date onwards
+			query = query.where(sle.posting_date >= self.from_date)
 
 		if self.to_date:
 			query = query.where(sle.posting_date <= self.to_date)
